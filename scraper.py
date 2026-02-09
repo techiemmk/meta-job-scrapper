@@ -55,7 +55,7 @@ class MetaJobScraper:
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await page.wait_for_timeout(2000)
         
-        total_pages_info = await page.evaluate("""() => {
+        total_pages_info = await page.evaluate(r"""() => {
             const match = document.body.innerText.match(/Page \d+ of (\d+)/);
             return match ? parseInt(match[1]) : 1;
         }""")
@@ -237,7 +237,8 @@ class MetaJobScraper:
                     # Fallback to DOM if JSON field is empty
                     if not extra_info:
                         extra_info = await page.evaluate("""() => {
-                            const salarySpan = Array.from(document.querySelectorAll('span')).find(s => s.innerText.includes('/year'));
+                            const salarySpan = Array.from(document.querySelectorAll('span'))
+                                .find(s => s.innerText.includes('/year') || s.innerText.includes('/month') || s.innerText.includes('/hour') || s.innerText.includes('/week'));
                             if (!salarySpan) return "";
                             // Find the container that holds the salary and the text below it
                             let parent = salarySpan.parentElement;
@@ -326,13 +327,87 @@ class MetaJobScraper:
 
     async def scrape_dom_details(self, page, url):
         # Improved DOM fallback if JSON fails
-        return await page.evaluate("""() => {
+        # This handles the requirement to click '+' symbols
+        try:
+            # Look for expandable locations/departments and click them
+            await page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('div, span, button'))
+                    .filter(el => {
+                        const text = el.innerText || "";
+                        return text.includes('+') && (text.includes('Location') || text.includes('more'));
+                    });
+                buttons.forEach(btn => btn.click());
+            }""")
+            await page.wait_for_timeout(1000)
+
+            return await page.evaluate("""() => {
                 const res = { job_link: window.location.href };
-                // Basic labels
+                
+                // 1. Job Name - H1 tag below the breadcrumb
+                // Usually breadcrumbs are in a nav or have a specific class
                 const h1 = document.querySelector('h1');
                 res.job_name = h1 ? h1.innerText.trim() : "";
+
+                // 2. Job Location - Expandable section below title
+                // We've already clicked, now find the text
+                const locationSection = Array.from(document.querySelectorAll('div'))
+                    .find(div => div.innerText.includes('Location') && div.querySelector('span'));
+                res.job_location = locationSection ? locationSection.innerText.replace(/Location[s]?/, '').trim() : "";
+
+                // 3. Job Department
+                const deptSection = Array.from(document.querySelectorAll('div'))
+                    .find(div => div.innerText.includes('Department') && div.querySelector('span'));
+                res.job_department = deptSection ? deptSection.innerText.replace('Department', '').trim() : "";
+
+                // 4. Job Description - paragraph below Apply Now
+                const applyBtn = Array.from(document.querySelectorAll('div')).find(d => d.innerText === 'Apply Now');
+                if (applyBtn) {
+                    let next = applyBtn.nextElementSibling;
+                    while (next && next.innerText.length < 20) next = next.nextElementSibling;
+                    res.job_description = next ? next.innerText.trim() : "";
+                }
+
+                // 6. Qualifications
+                const minQualH2 = Array.from(document.querySelectorAll('h2')).find(h => h.innerText.includes('Minimum Qualifications'));
+                if (minQualH2) {
+                    const ul = minQualH2.nextElementSibling;
+                    res.minimum_qualifications = ul ? ul.innerText.trim() : "";
+                }
+                const prefQualH2 = Array.from(document.querySelectorAll('h2')).find(h => h.innerText.includes('Preferred Qualifications'));
+                if (prefQualH2) {
+                    const ul = prefQualH2.nextElementSibling;
+                    res.preferred_qualifications = ul ? ul.innerText.trim() : "";
+                }
+
+                // 7. About Meta
+                const aboutH2 = Array.from(document.querySelectorAll('h2')).find(h => h.innerText.includes('About Meta'));
+                if (aboutH2) {
+                    const p = aboutH2.nextElementSibling;
+                    res.about_meta = p ? p.innerText.trim() : "";
+                }
+
+                // 8. Salary
+                const salarySpan = Array.from(document.querySelectorAll('span'))
+                    .find(s => s.innerText.startsWith('$'));
+                res.salary = salarySpan ? salarySpan.innerText.trim() : "";
+
+                // 10. EEO
+                const eeoH2 = Array.from(document.querySelectorAll('h2')).find(h => h.innerText.includes('Equal Employment Opportunity'));
+                if (eeoH2) {
+                    let content = "";
+                    let next = eeoH2.nextElementSibling;
+                    while (next && next.tagName !== 'H2' && next.tagName !== 'HR') {
+                        content += next.innerText + "\\n";
+                        next = next.nextElementSibling;
+                    }
+                    res.eeo = content.trim();
+                }
+
                 return res; 
             }""")
+        except Exception as e:
+            print(f"Error in DOM fallback: {e}")
+            return { "job_link": url, "job_name": "Error during DOM fallback" }
 
     def save_to_formats(self, base_filename):
         if not self.jobs:
